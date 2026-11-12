@@ -75,6 +75,7 @@ func (s *Server) orchestrationTools() []actool.CoreTool {
 		s.toolListWorkerTraces(),
 		s.toolSearchWorkerTraces(),
 		s.toolGetTaskNodeDetail(),
+		s.toolGetFindingReportContext(),
 		s.toolUpdateFindingReport(),
 		s.toolGetFindingTraffic(),
 		s.toolBindFindingTraffic(),
@@ -420,36 +421,79 @@ func (s *Server) toolGetTaskNodeDetail() actool.CoreTool {
 }
 
 // toolUpdateFindingReport writes/overwrites a finding's detailed Markdown report.
-// finding_id is the id report_finding returned ("finding recorded: <id>", the
-// finding node id). The write (SetFindingReportByNodeID) is keyed by node_id and
-// task-agnostic, so this host tool needs no task_id / exploration store.
+// finding_record_id is the standalone record; the legacy finding_id is a node.
+// Task-bound calls enforce ownership before the atomic evidence-version check.
 func (s *Server) toolUpdateFindingReport() actool.CoreTool {
 	return wrTool("update_finding_report",
-		"为已登记的漏洞写入/更新【详细报告】(Markdown 全文,整段覆盖旧内容)。finding_id 传 report_finding 返回的那个 id(\"finding recorded: <id>\" 里的数字)。报告建议包含:漏洞概述、影响与危害、复现步骤、证据/PoC、修复建议。",
+		"保存一个已登记漏洞的完整 Markdown 复现报告。优先用 finding_record_id（独立漏洞记录 ID）；兼容 finding_id（探索节点 ID），两者只能传一个。evidence_version 必须是实际读取的当前版本，包括无流量时的 0。版本冲突应重读证据并修订全文；不得仅换版本重试。",
 		objSchema(map[string]any{
-			"finding_id":       map[string]any{"type": "integer", "description": "目标漏洞 id(report_finding 返回的 id)"},
-			"report":           strParam("详细报告全文,Markdown 格式"),
-			"evidence_version": map[string]any{"type": "integer", "description": "get_finding_traffic 返回的证据 version；用于防止报告覆盖新的证据变更"},
-		}, "finding_id", "report"),
+			"finding_id":        map[string]any{"type": "integer", "description": "兼容旧调用：探索节点 ID，与 finding_record_id 二选一"},
+			"finding_record_id": strParam("独立漏洞记录 ID，从 get_finding_report_context 的 finding_id 读取"),
+			"report":            strParam("详细报告全文,Markdown 格式"),
+			"evidence_version":  map[string]any{"type": "integer", "description": "get_finding_traffic 返回的证据 version；用于防止报告覆盖新的证据变更"},
+			"with_images":       map[string]any{"type": "boolean", "description": "是否把真实步骤结果、成对请求/响应及已存在页面截图生成为报告图片；写复现报告时设为 true"},
+			"report_steps": map[string]any{"type": "array", "description": "报告中的复现步骤证据映射；每步至少提供 step_id、binding_id、screenshot_path 中的一项真实来源", "items": objSchema(map[string]any{
+				"title":           strParam("报告中的步骤标题"),
+				"intent_id":       map[string]any{"type": "integer", "description": "get_task_worker_trace 使用的来源意图 ID；step_id 必填时必填"},
+				"step_id":         map[string]any{"type": "integer", "description": "get_task_worker_trace 返回的真实活动步骤 ID；必须属于 intent_id"},
+				"binding_id":      map[string]any{"type": "integer", "description": "get_finding_traffic 返回且属于当前漏洞的绑定 ID；生成同页请求和响应图"},
+				"screenshot_path": strParam("任务目录下已存在的 PNG 页面截图相对路径；worker 浏览器截图格式为 i<intent_id>/screenshots/<实际文件名>"),
+			})},
+		}, "report", "evidence_version"),
 		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
 			var a struct {
-				EvidenceVersion *int64          `json:"evidence_version"`
-				FindingID       json.RawMessage `json:"finding_id"`
-				Report          string          `json:"report"`
+				EvidenceVersion *int64                 `json:"evidence_version"`
+				FindingID       json.RawMessage        `json:"finding_id"`
+				FindingRecordID json.RawMessage        `json:"finding_record_id"`
+				Report          string                 `json:"report"`
+				WithImages      bool                   `json:"with_images"`
+				ReportSteps     []reportImageStepInput `json:"report_steps"`
 			}
-			_ = json.Unmarshal(in, &a)
-			nodeID := parseProfileID(a.FindingID) // 复用「数字或数字字符串」解析
-			if nodeID <= 0 {
-				return actool.Errorf("finding_id 无效"), nil
+			if err := json.Unmarshal(in, &a); err != nil {
+				return actool.Errorf("无效 JSON: " + err.Error()), nil
 			}
-			n, err := s.m.pg.SetFindingReportVersionByNodeID(ctx, nodeID, a.Report, a.EvidenceVersion)
+			if (len(a.FindingID) == 0) == (len(a.FindingRecordID) == 0) {
+				return actool.Errorf("finding_record_id 与旧 finding_id 必须且只能提供一个"), nil
+			}
+			if strings.TrimSpace(a.Report) == "" {
+				return actool.Errorf("report 不能为空"), nil
+			}
+			if a.EvidenceVersion == nil || *a.EvidenceVersion < 0 {
+				return actool.Errorf("evidence_version 必须为实际读取的非负版本；无流量时传 0"), nil
+			}
+			id := parseProfileID(a.FindingRecordID)
+			if len(a.FindingID) > 0 {
+				nodeID := parseProfileID(a.FindingID)
+				if nodeID <= 0 {
+					return actool.Errorf("finding_id 必须为有效探索节点 ID"), nil
+				}
+				var err error
+				id, err = s.m.pg.FindingIDByNodeID(nodeID)
+				if err != nil {
+					return actool.Errorf("未找到该探索节点对应的漏洞记录：" + err.Error()), nil
+				}
+			}
+			if err := s.agentFindingTrafficAccess(ctx, id, true); err != nil {
+				return actool.Errorf(err.Error()), nil
+			}
+			reportText := a.Report
+			var err error
+			if a.WithImages {
+				reportText, err = s.addFindingReportImages(ctx, id, reportText, *a.EvidenceVersion, a.ReportSteps)
+				if err != nil {
+					return actool.Errorf("报告图片生成失败，原报告未覆盖：" + err.Error()), nil
+				}
+			} else if len(a.ReportSteps) > 0 {
+				return actool.Errorf("提供了 report_steps 时必须设置 with_images=true"), nil
+			}
+			n, err := s.m.pg.SetFindingReportVersionByID(ctx, id, reportText, a.EvidenceVersion)
 			if err != nil {
 				return actool.Errorf(err.Error()), nil
 			}
 			if n == 0 {
-				return actool.Errorf(fmt.Sprintf("未找到 finding_id=%d 对应的漏洞记录(先用 report_finding 登记)", nodeID)), nil
+				return actool.Errorf(fmt.Sprintf("未找到漏洞记录 #%d", id)), nil
 			}
-			return actool.Text(fmt.Sprintf("finding %d report updated (%d chars)", nodeID, len(a.Report))), nil
+			return actool.Text(fmt.Sprintf("finding %d report updated (%d chars)", id, len(reportText))), nil
 		})
 }
 
@@ -495,14 +539,16 @@ func (s *Server) seedOrchestrationTools() {
 	s.seedWorkerReadbackRebind()  // 修复旧迁移误删：把 search_all_worker_traces/get_worker_trace/node_detail 补绑回 worker(一次性)
 	s.seedAutoReportFindingBinding()
 	s.unbindGoalMetDefault()
-	s.reseedGoalsPrompt()             // goals 提示词加入「抽操作约束」步 → 旧库追加一版新默认(一次性)
-	s.reseedMainAgentPrompt()         // mainagent 提示词加入「目标达成后 add_intent 反问是否建目标」(一次性)
-	s.reseedPlannerPrompt()           // planner 提示词:重写「0 意图」正当理由 + 加量化验收核对(一次性)
-	s.reseedWorkerPrompt()            // worker 提示词:加否定结论证据门槛(一次性)
-	s.seedReporterAgent()             // 预置「报告撰写」agent + 工具绑定 + finding 触发器(一次性)
-	s.upgradeReporterTriggerMessage() // 老库补迁移:让 reporter 回传 evidence_version(一次性)
-	s.seedFindingTrafficTools()       // 增加可选证据参数及只读证据工具，保留用户配置
+	s.reseedGoalsPrompt()       // goals 提示词加入「抽操作约束」步 → 旧库追加一版新默认(一次性)
+	s.reseedMainAgentPrompt()   // mainagent 提示词加入「目标达成后 add_intent 反问是否建目标」(一次性)
+	s.reseedPlannerPrompt()     // planner 提示词:重写「0 意图」正当理由 + 加量化验收核对(一次性)
+	s.reseedWorkerPrompt()      // worker 提示词:加否定结论证据门槛(一次性)
+	s.seedReporterAgent()       // 预置「报告撰写」agent + 工具绑定 + finding 触发器(一次性)
+	s.seedFindingTrafficTools() // 增加可选证据参数及只读证据工具，保留用户配置
 	s.seedFindingWorkflowTools()
+	if err := s.upgradeReporterCapabilities(); err != nil {
+		log.Printf("[reporter] 复现报告能力升级失败，下次启动重试: %v", err)
+	}
 	// 注：pentest 的默认工具绑定无需迁移——BuiltinToolSeeds 在全新初始化时就把
 	// list_assets/insert_assets/report_finding/list_findings/list_companies 连同
 	// pentest 一起 seed 好了（项目尚无旧库，不做迁移）。
@@ -684,12 +730,20 @@ func (s *Server) reseedWorkerPrompt() {
 	log.Printf("[prompts] worker 提示词已追加新默认版本(查上下文段收敛为 list_assets/list_findings,去掉 list_facts/node_detail/asset_neighbors,一次性)")
 }
 
-// reporterToolCallMessage 必须无条件要求先读一次 get_finding_traffic 再写报告。
-// 该工具是只读的、「不依赖捕获开关」,自动绑定关不关都能读到人工绑定的证据。若这里
-// 写成「启用自动绑定才读」,默认关闭配置下 reporter 就不会传 evidence_version,
-// SetFindingReportVersionByNodeID 便按 legacy 语义写 -1,漏洞详情与 Markdown 导出
-// 从此常驻「证据已变更，报告待更新」,而 UI 上没有任何入口能把它清掉。
-const reporterToolCallMessage = "上面刚有一个漏洞被 report_finding 登记。请读取返回 JSON 的 finding_id（独立漏洞记录 ID）与 finding_node_id（探索节点 ID），" +
+// Always read the report context/version, even with capture or binding disabled.
+// Historical default messages are kept verbatim for precise upgrade matching.
+const reporterToolCallMessage = "本次 report_finding 已成功登记漏洞。先加载可见的 vuln-report-writer Skill，再用 get_finding_report_context(finding_id=返回 JSON 中的独立漏洞编号) 读取完整证据、资产、任务与 intent_ids。" +
+	"若只有探索节点编号，用 finding_node_id 查询上下文，不猜测编号。有流量时分段读取真实请求/响应；按实际前提、角色、参数、步骤、观察和证据出处写复现报告。" +
+	"自动绑定完成后重新读取 evidence_version；按真实 intent_id+step_id 建立 report_steps，有 HTTP 流量时附 binding_id，并用 update_finding_report(finding_record_id=独立漏洞编号,report=全文,evidence_version=实际读取版本,with_images=true,report_steps=真实映射) 保存。请求和响应会成对生成图片，长内容分页；无流量版本为 0。" +
+	"证据缺口如实标注，不重新探测、不改等级，不生成或宣称已有 DOCX。"
+
+// Previous built-in reporter trigger; only this exact default is upgraded.
+const reporterToolCallMessageV3 = "本次 report_finding 已成功登记漏洞。先加载可见的 vuln-report-writer Skill，再用 get_finding_report_context(finding_id=返回 JSON 中的独立漏洞编号) 读取完整证据、资产、任务与 intent_ids。" +
+	"若只有探索节点编号，用 finding_node_id 查询上下文，不猜测编号。有流量时分段读取真实请求/响应；按实际前提、角色、参数、步骤、观察和证据出处写复现报告。" +
+	"自动绑定完成后重新读取 evidence_version，用 update_finding_report(finding_record_id=独立漏洞编号,report=全文,evidence_version=实际读取版本) 保存；无流量版本为 0。" +
+	"证据缺口如实标注，不重新探测、不改等级，不生成或宣称已有 DOCX。"
+
+const reporterToolCallMessageV2 = "上面刚有一个漏洞被 report_finding 登记。请读取返回 JSON 的 finding_id（独立漏洞记录 ID）与 finding_node_id（探索节点 ID），" +
 	"先用 get_finding_traffic(finding_id) 读取当前证据清单及其 version（空清单是正常情况，照常写报告）；" +
 	"若运行指引启用自动绑定，在读取前先核实并关联本次漏洞的流量。节点详情使用 finding_node_id。" +
 	"最后调用 update_finding_report(finding_id=finding_node_id, report, evidence_version=实际读取版本) 保存，" +
@@ -699,34 +753,6 @@ const reporterToolCallMessage = "上面刚有一个漏洞被 report_finding 登�
 const reporterToolCallMessageV1 = "上面刚有一个漏洞被 report_finding 登记。请从触发上下文里取出 finding_id" +
 	"（工具返回 \"finding recorded: <id>\" 里的数字）与任务 id，按你的职责撰写该漏洞的详细报告，" +
 	"最后调用 update_finding_report(finding_id, report) 保存。"
-
-// upgradeReporterTriggerMessage 把老库里仍是默认文案的 reporter 触发消息刷成新版本。
-// seedReporterAgent 受 reporter_agent_seed_v1 守卫且只在新建 agent 时写触发器，所以
-// 升级上来的库拿不到新文案 —— 工具 schema 由 seedFindingTrafficTools 补齐了
-// evidence_version，但没有任何东西告诉 reporter 去用它。一次性，且只覆盖未被改动的文案。
-func (s *Server) upgradeReporterTriggerMessage() {
-	const flag = "reporter_trigger_evidence_version_v1"
-	if v, _, _ := s.m.pg.GetSetting(flag); v == "true" {
-		return
-	}
-	defer func() { _ = s.m.pg.SetSetting(flag, "true") }() // 只尝试一次
-	triggers, err := s.m.pg.ListTriggersFor("reporter")
-	if err != nil {
-		log.Printf("[reporter] 读取触发器失败: %v", err)
-		return
-	}
-	for _, t := range triggers {
-		if !t.OnToolCall || t.ToolCallMessage != reporterToolCallMessageV1 {
-			continue // 用户改过或不是 finding 触发器，不动。
-		}
-		t.ToolCallMessage = reporterToolCallMessage
-		if err := s.m.pg.UpdateTrigger(t); err != nil {
-			log.Printf("[reporter] 升级触发消息失败: %v", err)
-			return
-		}
-		log.Printf("[reporter] 触发消息已升级为读取并回传 evidence_version")
-	}
-}
 
 // seedReporterAgent 预置一个「报告撰写」自定义 agent(builtin=false，可在 UI 编辑/删除)：
 // 绑定 update_finding_report + 任务查询工具，并挂一个「report_finding 被调用即触发」的
@@ -759,7 +785,7 @@ func (s *Server) seedReporterAgent() {
 	}
 	// 绑定它需要的工具：写报告 + 读证据/执行过程/态势。
 	if err := s.m.pg.AddAgentToToolBinding("reporter", []string{
-		"update_finding_report", "get_task_node_detail", "list_task_findings",
+		"update_finding_report", "get_finding_report_context", "get_task_node_detail", "list_task_findings",
 		"get_task_worker_trace", "list_task_worker_traces", "search_task_worker_traces",
 		"get_task_graph",
 	}); err != nil {

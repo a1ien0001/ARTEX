@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"io"
 	"log"
+	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/Autumn-27/artex/agent"
@@ -19,10 +21,11 @@ import (
 // an agent's visible skills are loaded from the filesystem and packed into one
 // Skill meta-tool; its visible stdio MCP servers are spawned and expanded to
 // mcp__server__tool. skillDir is the root directory of all skill subdirectories.
+// workDir is the artifact root used to scope browser screenshots to one worker run.
 // hostTools, if set, returns runtime host tools (currently the traffic tools when
 // capture is on) to add to EVERY agent's base list — the DB tools table then
 // filters them per-agent binding. Empty/nil → no host tools this run (capture off).
-func wireAgentAugment(pg *db.DB, skillDir string, hostTools func() ([]actool.CoreTool, map[string][]string)) {
+func wireAgentAugment(pg *db.DB, skillDir, workDir string, hostTools func() ([]actool.CoreTool, map[string][]string)) {
 	agent.ToolAugment = func(ctx context.Context, agentKey string) ([]actool.CoreTool, agent.DeferredInfo, func()) {
 		a, err := pg.GetAgentByKey(agentKey)
 		if err != nil || a == nil {
@@ -70,6 +73,7 @@ func wireAgentAugment(pg *db.DB, skillDir string, hostTools func() ([]actool.Cor
 		serverTools := map[string][]string{} // server name → its tool names
 		var allNames, globalNames []string
 		globalSet := map[string]bool{}
+		runInfo := agent.RunInfoFrom(ctx)
 		{
 			mcpIDs, _ := pg.AgentVisible(a.ID, "mcp")
 			want := idSet(mcpIDs)
@@ -83,7 +87,18 @@ func wireAgentAugment(pg *db.DB, skillDir string, hostTools func() ([]actool.Cor
 				if !directVisible && !skillGated {
 					continue // neither directly visible nor referenced by a visible skill
 				}
-				cl, err := connectMCP(ctx, m)
+				mcpConfig := m
+				if agentKey == "worker" && m.Name == browserMCPName && runInfo.TaskID > 0 && runInfo.IntentID > 0 {
+					configuredMCP, configured, configErr := browserMCPForRun(m, workDir, runInfo)
+					if configErr != nil {
+						log.Printf("[mcp] browser 截图目录配置失败: %v", configErr)
+						continue
+					}
+					if configured {
+						mcpConfig = configuredMCP
+					}
+				}
+				cl, err := connectMCP(ctx, mcpConfig)
 				if err != nil {
 					log.Printf("[mcp] %s 连接失败: %v", m.Name, err)
 					continue
@@ -177,6 +192,58 @@ func wireAgentAugment(pg *db.DB, skillDir string, hostTools func() ([]actool.Cor
 		}
 		return extra, def, cleanup
 	}
+}
+
+// browserMCPForRun gives a worker's Playwright MCP an isolated auto-output
+// directory. browser_take_screenshot's automatic filename is returned by MCP and
+// can then be cited by update_finding_report relative to tasks/<taskID>.
+func browserMCPForRun(base *db.MCPServer, dataDir string, run agent.RunInfo) (*db.MCPServer, bool, error) {
+	if base == nil || base.Name != browserMCPName || run.TaskID <= 0 || run.IntentID <= 0 || strings.TrimSpace(dataDir) == "" {
+		return base, false, nil
+	}
+	args := jsonStrSlice(base.Args)
+	isPlaywright := false
+	for _, arg := range args {
+		if strings.Contains(arg, "@playwright/mcp") {
+			isPlaywright = true
+			break
+		}
+	}
+	if !isPlaywright {
+		return base, false, nil
+	}
+	outputDir := filepath.Join(dataDir, "tasks", strconv.FormatInt(run.TaskID, 10), "i"+strconv.FormatInt(run.IntentID, 10), "screenshots")
+	if err := os.MkdirAll(outputDir, 0o755); err != nil {
+		return nil, false, err
+	}
+	args = removeFlagAndValue(args, "--output-dir")
+	args = removeFlagAndValue(args, "--file-paths")
+	args = append(args, "--output-dir", outputDir, "--file-paths", "absolute")
+	encoded, err := json.Marshal(args)
+	if err != nil {
+		return nil, false, err
+	}
+	configured := *base
+	configured.Args = encoded
+	return &configured, true, nil
+}
+
+func removeFlagAndValue(args []string, flag string) []string {
+	filtered := make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == flag {
+			if i+1 < len(args) && !strings.HasPrefix(args[i+1], "--") {
+				i++
+			}
+			continue
+		}
+		if strings.HasPrefix(arg, flag+"=") {
+			continue
+		}
+		filtered = append(filtered, arg)
+	}
+	return filtered
 }
 
 func idSet(ids []int64) map[int64]bool {

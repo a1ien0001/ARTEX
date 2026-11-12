@@ -295,6 +295,114 @@ CREATE TABLE IF NOT EXISTS task_constraints (
 );
 CREATE INDEX IF NOT EXISTS idx_task_constraints_exp ON task_constraints(exploration_id);
 
+-- =====================================================================
+-- B2. 功能图层 (Function Graph) — 业务语义模型
+-- 承载「前端给人看的业务缩影」的结构化版本:模块→功能→动作 层级 + 角色可达性 +
+-- 不变量(本不该如此)。与资产图(技术清单)、探索图(攻击血缘)并列的第三张图,靠
+-- function_asset_map 桥到资产图。按 exploration 作用域(每任务一份推进链),与探索图一致。
+-- =====================================================================
+
+-- function_nodes: 业务功能节点。module(模块)→feature(功能)→action(动作) 三层。
+-- seen_roles 记哪些角色实际看到/到达过它(角色可达性);intended_roles 记规范上本该哪些
+-- 角色拥有它(可空,来自建模推断/人工)。confidence: observed(菜单/UI直接看到) | inferred。
+CREATE TABLE IF NOT EXISTS function_nodes (
+    id      BIGSERIAL PRIMARY KEY,
+    exploration_id BIGINT NOT NULL REFERENCES explorations(id) ON DELETE CASCADE,
+    app_id         BIGINT,  -- 所属应用根(资产图 type=app/subdomain 的 id,松引用,生命周期随 exploration)
+    kind    TEXT NOT NULL,
+    name    TEXT NOT NULL,
+    path    TEXT,           -- UI 路由/面包屑,如 /order/:id/refund
+    state_pre      TEXT,           -- 进入该动作要求的业务状态(如 已支付),仅 action
+    seen_roles     JSONB NOT NULL DEFAULT '[]',  -- 实际看到/到达过该节点的角色集合(并集合并)
+    intended_roles JSONB,   -- 规范性:本该哪些角色拥有(可空)
+    confidence     TEXT NOT NULL DEFAULT 'observed',
+    payload        JSONB NOT NULL DEFAULT '{}',
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT ck_fnode_kind CHECK (kind IN ('module','feature','action')),
+    CONSTRAINT ck_fnode_confidence CHECK (confidence IN ('observed','inferred'))
+);
+-- dedup key: 同一探索下 (kind, path, name) 唯一。path 可空,用 COALESCE 归一,避免 NULL 破坏唯一性。
+CREATE UNIQUE INDEX IF NOT EXISTS uq_fnode ON function_nodes(exploration_id, kind, COALESCE(path,''), name);
+CREATE INDEX IF NOT EXISTS idx_fnode_exp ON function_nodes(exploration_id, kind);
+CREATE INDEX IF NOT EXISTS idx_fnode_app ON function_nodes(app_id);
+DROP TRIGGER IF EXISTS trg_fnode_upd ON function_nodes;
+CREATE TRIGGER trg_fnode_upd BEFORE UPDATE ON function_nodes
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- function_edges: 功能图内部层级/旅程边(两端都是 function_nodes)。
+-- contains: module→feature→action 层级;precedes: action→action 旅程顺序(P3,guard 记状态守卫)。
+-- maps_to(动作→资产 endpoint)走 function_asset_map;guarded_by(动作→不变量)用 invariants.target_node 表达。
+CREATE TABLE IF NOT EXISTS function_edges (
+    exploration_id BIGINT NOT NULL REFERENCES explorations(id) ON DELETE CASCADE,
+    src_id  BIGINT NOT NULL REFERENCES function_nodes(id) ON DELETE CASCADE,
+    dst_id         BIGINT NOT NULL REFERENCES function_nodes(id) ON DELETE CASCADE,
+    rel     TEXT NOT NULL,
+    guard          TEXT,           -- precedes 的状态守卫 / 其它元数据
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (exploration_id, src_id, rel, dst_id),
+    CONSTRAINT ck_fedge_noself CHECK (src_id <> dst_id),
+    CONSTRAINT ck_fedge_rel    CHECK (rel IN ('contains','precedes'))
+);
+CREATE INDEX IF NOT EXISTS idx_fedge_src ON function_edges(src_id, rel);
+CREATE INDEX IF NOT EXISTS idx_fedge_dst ON function_edges(dst_id, rel);
+
+-- function_asset_map: maps_to 桥 —— 动作 ↔ 资产图 endpoint。只存引用,不拷贝接口数据。
+-- N:M(一个动作多个接口、一个接口多个动作)。asset 删除时级联清理,避免孤儿映射。
+CREATE TABLE IF NOT EXISTS function_asset_map (
+    exploration_id   BIGINT NOT NULL REFERENCES explorations(id) ON DELETE CASCADE,
+    function_node_id BIGINT NOT NULL REFERENCES function_nodes(id) ON DELETE CASCADE,
+    asset_id         BIGINT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+    evidence         TEXT,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (function_node_id, asset_id)
+);
+CREATE INDEX IF NOT EXISTS idx_fmap_asset ON function_asset_map(asset_id);
+CREATE INDEX IF NOT EXISTS idx_fmap_exp   ON function_asset_map(exploration_id);
+
+-- invariants: 规范层「本不该如此」(oracle)。authz(越权)/ownership(归属·IDOR)/
+-- state(非法迁移)/resource(资源·额度)。source 记怎么得出(角色diff/旅程diff/人工/文档)。
+-- target_node 关联被它保护的功能节点(即 guarded_by 关系)。status: open(待验)|holds(验过成立)|violated(测出洞)。
+CREATE TABLE IF NOT EXISTS invariants (
+    id      BIGSERIAL PRIMARY KEY,
+    exploration_id BIGINT NOT NULL REFERENCES explorations(id) ON DELETE CASCADE,
+    app_id  BIGINT,
+    kind    TEXT NOT NULL,
+    statement      TEXT NOT NULL,
+    target_node    BIGINT REFERENCES function_nodes(id) ON DELETE SET NULL,
+    source  TEXT NOT NULL,
+    evidence       TEXT,
+    status  TEXT NOT NULL DEFAULT 'open',
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT ck_inv_kind   CHECK (kind IN ('authz','ownership','state','resource')),
+    CONSTRAINT ck_inv_source CHECK (source IN ('role_diff','journey','hint','doc')),
+    CONSTRAINT ck_inv_status CHECK (status IN ('open','holds','violated'))
+);
+CREATE INDEX IF NOT EXISTS idx_inv_exp ON invariants(exploration_id, status);
+DROP TRIGGER IF EXISTS trg_inv_upd ON invariants;
+CREATE TRIGGER trg_inv_upd BEFORE UPDATE ON invariants
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- function_access: 每任务叠加层 —— 授权矩阵实测格子。某角色实测某动作的结果。
+-- 是 function_coverage 分子的来源(P2 由攻击 worker 的 replay_as_role 填充)。
+CREATE TABLE IF NOT EXISTS function_access (
+    exploration_id   BIGINT NOT NULL REFERENCES explorations(id) ON DELETE CASCADE,
+    task_id          BIGINT NOT NULL,
+    function_node_id BIGINT NOT NULL REFERENCES function_nodes(id) ON DELETE CASCADE,
+    role      TEXT NOT NULL,
+    result    TEXT NOT NULL,
+    evidence_id      BIGINT,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT ck_faccess_result CHECK (result IN ('allowed','denied','unknown'))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_faccess ON function_access(task_id, function_node_id, role);
+CREATE INDEX IF NOT EXISTS idx_faccess_node ON function_access(function_node_id);
+DROP TRIGGER IF EXISTS trg_faccess_upd ON function_access;
+CREATE TRIGGER trg_faccess_upd BEFORE UPDATE ON function_access
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
 CREATE TABLE IF NOT EXISTS activity (
     id                 BIGSERIAL PRIMARY KEY,
     exploration_id     BIGINT NOT NULL REFERENCES explorations(id) ON DELETE CASCADE,

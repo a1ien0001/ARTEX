@@ -43,6 +43,7 @@ import { AssetsTab } from "./_tabs/assets-tab";
 import { BroadcastTab } from "./_tabs/broadcast-tab";
 import { CoverageGraphTab } from "./_tabs/coverage-graph-tab";
 import { FindingsTab } from "./_tabs/findings-tab";
+import { FunctionGraphTab } from "./_tabs/function-graph-tab";
 import { GraphTab } from "./_tabs/graph-tab";
 import { InterceptTab } from "./_tabs/intercept-tab";
 import { OverviewTab } from "./_tabs/overview-tab";
@@ -59,6 +60,7 @@ const TABS = [
   { value: "retests", label: "复测" },
   { value: "assets", label: "测试资产" },
   { value: "coverage", label: "资产覆盖图" },
+  { value: "function", label: "功能图" },
   { value: "intercept", label: "拦截审批" },
   { value: "report", label: "报告" },
 ];
@@ -440,6 +442,9 @@ function TaskDetailInner() {
         </TabsContent>
         <TabsContent value="coverage" className="mt-0">
           <CoverageGraphTab taskId={id} coverageEnabled={task?.coverage_enabled !== false} />
+        </TabsContent>
+        <TabsContent value="function" className="mt-0">
+          <FunctionGraphTab taskId={id} />
         </TabsContent>
         <TabsContent value="intercept" className="mt-0">
           <InterceptTab taskId={id} />

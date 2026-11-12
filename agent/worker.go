@@ -85,7 +85,22 @@ type Worker struct {
 	// maxTokensFn resolves the per-reply output cap in tokens, on the same
 	// per-run basis. nil or 0 = send no cap and let the endpoint decide.
 	maxTokensFn func() int
+	// agentKey selects the prompt/tool/settlement profile: "" or "worker" = the
+	// default work agent; "modeler" = the business-modeling profile (function-graph
+	// tools, modeler prompt, no attack/finding tools). Set via NewModelerWorker.
+	agentKey string
 }
+
+// workerKey returns the resolved agent profile key ("worker" when unset).
+func (w *Worker) workerKey() string {
+	if w.agentKey == "" {
+		return "worker"
+	}
+	return w.agentKey
+}
+
+// isModeler reports whether this worker runs the business-modeling profile.
+func (w *Worker) isModeler() bool { return w.agentKey == "modeler" }
 
 // WorkerSessionID returns the stable transcript key used by a worker intent.
 // Worker slots are reusable, so the intent id (rather than work#N) is the
@@ -155,6 +170,17 @@ const settleWrapUpPrompt = "你即将因预算耗尽被终止。不要再运行�
 
 func NewWorker(prov llm.Provider, model, workDir string, tx *transcript.Store, window, maxTurns int, extra ...actool.CoreTool) *Worker {
 	return &Worker{prov: prov, model: model, workDir: workDir, tx: tx, window: window, maxTurns: maxTurns, extraTools: extra}
+}
+
+// NewModelerWorker builds a Worker running the "modeler" (业务建模) profile: same
+// execution machine as a work agent, but it renders the modeler prompt, binds
+// ModelerTools (function-graph write/read, no attack/finding tools), and keys its
+// transcript/settlement under "modeler". Dispatched by the engine for intents whose
+// Origin == "modeler".
+func NewModelerWorker(prov llm.Provider, model, workDir string, tx *transcript.Store, window, maxTurns int, extra ...actool.CoreTool) *Worker {
+	w := NewWorker(prov, model, workDir, tx, window, maxTurns, extra...)
+	w.agentKey = "modeler"
+	return w
 }
 
 // defaultToolsExcept returns actool.DefaultTools() minus the named tools (by
@@ -239,6 +265,11 @@ const workerDefaultTmpl = `你是一个网络安全平台授权渗透测试系�
 - **探索结论/事实 → record_fact（探索图，传 intent_id）**：都用它。**多个观察汇总成【一条】事实**（summary 一句总结 + detail写对总结的拓展，依靠真实的执行过程），不要一个属性一条、一意图通常只一条，拆碎会让图谱无限膨胀——**默认就写一条，能并进 detail 的都并进去**；仅当确有【彼此完全独立、无法归并】的结论时才用 facts 数组分条，这是极少数例外，不是常规。**只写增量**：只记这次【新得到】的，别把已有事实换措辞重记（只印证已有、无新增就不必记）。**只写真实看到的**：给 evidence（一行：命令+最能证明的一两行输出，简洁，细节在 detail）、标 confidence（observed=直接看到 / inferred=据现象推断）。
 - **确认漏洞 → report_finding（探索图，含 PoC，传 intent_id）**：**只有你本次真实触发过、拿到可复现证据（请求/响应或命令输出）才用**。严禁把"版本/指纹匹配到 CVE""参数看起来可注入""外部漏洞库/更新日志/代码 diff 推断"当已确认，也不要用查 CVE 库或对比补丁版本替代实际触发。触发不了但有嫌疑 → 用 record_fact 记一条 inferred 事实（嫌疑点+为何未触发）交规划者，别硬记成 finding。
 
+**越权/逻辑意图（意图带 invariant_id / function_node_ids 时）**：这是规划者据功能图不变量派来的【换身份重放】靶子。做法：先用你【当前角色】的会话把目标动作跑通一次拿到基线请求，再【换成不变量里那个"不该有权限"的角色的会话/凭据】原样重放同一请求（换 cookie/token/Authorization，用 curl 走记录代理即可，证据照常留痕），对比两次响应：
+  - 低权角色被拒(403/302/空数据) → 不变量【成立】：resolve_invariant(status=holds)，并 record_function_access(role, result=denied)。
+  - 低权角色却放行、拿到了不该拿的数据/操作成功 → 【越权漏洞】：report_finding（含两次请求/响应对比做证据）+ resolve_invariant(status=violated) + record_function_access(role, result=allowed)。
+  非 HTTP 或测不了时 record_function_access(result=unknown) 并说明。别只测一个格子就收手，把意图里给的都测完。
+
 
 完成本意图后用一句话总结你做了什么、写回了哪些事实。`
 
@@ -265,7 +296,8 @@ func artifactSpec(dir string) string {
 // by the engine (ensureRunDir), so it just writes relative paths there — no manual
 // mkdir, no cross-worker name collisions.
 func workerArtifactSpec(runDir string) string {
-	return "\n\n**中间产物输出规约**：脚本、payload、抓到的响应体、临时数据等一切中间产物，**一律写到本次意图的专属工作目录 " + runDir + "**（已自动建好，直接用相对路径写在这里即可，无需再手动建目录）——**不要写 /tmp、不要用其它绝对路径**。"
+	return "\n\n**中间产物输出规约**：脚本、payload、抓到的响应体、临时数据等一切中间产物，**一律写到本次意图的专属工作目录 " + runDir + "**（已自动建好，直接用相对路径写在这里即可，无需再手动建目录）——**不要写 /tmp、不要用其它绝对路径**。" +
+		"\n\n**真实页面截图**：如果本次复现包含浏览器页面交互且 `browser_take_screenshot` 工具可用，在每个复现步骤的结果确认后调用截图工具，截取浏览器当前真实页面；长页面按需使用 fullPage。不要传 filename，让内置 browser MCP 将截图自动保存到本次意图目录的 `screenshots/`。记录工具结果返回的 PNG 文件名/路径，报告 Agent 会将它映射到相应步骤；截图必须来自真实浏览器，不能用请求/响应证据卡片替代，也不能从文字或日志伪造。没有浏览器工具或页面交互时如实保留截图缺口。"
 }
 
 // ensureRunDir builds and creates an agent's working directory under base:
@@ -290,6 +322,14 @@ func workerSystem(proxyAddr, caCert, dataDir, runDir string) string {
 	// caCert is present only when the recording MITM is on, which is exactly when
 	// the traffic_* tools are registered — so it gates the traffic-tool note.
 	// Optional finding guidance is added for every role after tool resolution.
+	return body + workerTrafficBlock(caCert != "") + workerArtifactSpec(runDir)
+}
+
+// modelerSystem renders the modeler profile's system prompt BODY (段 [A]) with the
+// same code-owned traffic note + artifact spec tail as workerSystem, but keyed on
+// "modeler" so a DB prompt override applies to the modeling agent specifically.
+func modelerSystem(proxyAddr, caCert, dataDir, runDir string) string {
+	body := renderSystem("modeler", ModelerDefaultPrompt, WorkerVars{ProxyAddr: proxyAddr, DataDir: dataDir, Now: nowStr()})
 	return body + workerTrafficBlock(caCert != "") + workerArtifactSpec(runDir)
 }
 
@@ -373,12 +413,18 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	// base = built-in worker tools ∪ host tools (traffic) ∪ default tools (incl. Bash);
 	// then augment with the agent's visible skills/MCP. During the SDK settlement
 	// phase, Bash is hidden via Settlement.DisabledTools (no local gating needed).
-	base := append(tsx.WorkerTools(), w.extraTools...)
+	// modeler profile binds ModelerTools (function-graph; no attack/finding tools).
+	var base []actool.CoreTool
+	if w.isModeler() {
+		base = append(tsx.ModelerTools(), w.extraTools...)
+	} else {
+		base = append(tsx.WorkerTools(), w.extraTools...)
+	}
 	// worker 刻意不给 MultiEdit/Glob/Grep：文件精改用 Edit、检索走 Bash(grep/find)，
 	// 收敛工具面、减少低价值调用。其余 SDK 默认工具(Read/Write/Edit/LS/Bash/Sleep)照常。
 	base = append(base, defaultToolsExcept("MultiEdit", "Glob", "Grep")...)
 	ctx = WithRunInfo(ctx, RunInfo{TaskID: taskID, ExplorationID: explorationID(ts), IntentID: intent.ID})
-	tools, def, cleanup := AugmentTools(ctx, "worker", base)
+	tools, def, cleanup := AugmentTools(ctx, w.workerKey(), base)
 	defer cleanup()
 
 	// 意图是 worker 的【唯一职责、贯穿整个 run 的不变量】→ 连同启动指令、意图锚定的目标资产
@@ -394,6 +440,9 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	ctx = intercept.WithReviewContext(ctx, runDir, intercept.ReviewBackground{})
 	overview := renderWorkerGraphOverview(tsx.graphOverviewData())
 	sysBody := workerSystem(w.proxyAddr, w.proxyCACert, w.workDir, runDir)
+	if w.isModeler() {
+		sysBody = modelerSystem(w.proxyAddr, w.proxyCACert, w.workDir, runDir)
+	}
 	if w.wantConstraints() {
 		sysBody += constraintBlock(ts) // 操作约束(若有)注入系统提示,worker 执行时严格遵守
 	}
@@ -422,9 +471,9 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	// 任务级 deadline(经 ctx 注入)夹逼本 run 的墙钟预算 + 决定收尾词(见 taskclock.go)。
 	tc := taskClockFrom(ctx)
 	maxDur, clamped := clampMaxDuration(tc.DeadlineUnix, w.runTimeout)
-	settle := wrapupSettlement("worker", []string{"Bash"})
+	settle := wrapupSettlement(w.workerKey(), []string{"Bash"})
 	if tc.DeadlineUnix > 0 {
-		settle = wrapupSettlementForTask("worker", []string{"Bash"}, clamped)
+		settle = wrapupSettlementForTask(w.workerKey(), []string{"Bash"}, clamped)
 	}
 	opts := agentcore.Options{
 		Provider:        w.prov,

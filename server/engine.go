@@ -148,6 +148,10 @@ type Engine struct {
 	// (for example an exhausted failover chain) — there is no global-pair fallback.
 	resolve              func(t *Task) (*agent.Planner, *agent.Worker)
 	resolveAuthoritative bool
+	// resolveModeler returns the task's modeler-profile worker (business modeling),
+	// used in place of the normal worker when the claimed intent's Origin=="modeler".
+	// nil → modeler intents fall back to the normal worker.
+	resolveModeler func(t *Task) *agent.Worker
 	// readiness reports whether a global LLM provider is configured — the signal behind
 	// Ready()/the llm_configured indicator. Wired once at startup; nil → not ready.
 	readiness func() bool
@@ -715,6 +719,11 @@ func (e *Engine) SetAuthoritativeAgentResolver(fn func(t *Task) (*agent.Planner,
 	e.resolveAuthoritative = true
 }
 
+// SetModelerResolver installs the per-task modeler-worker resolver. The engine uses
+// it for intents whose Origin=="modeler" so business-modeling runs on the modeler
+// profile (function-graph tools, modeler prompt) instead of the normal worker.
+func (e *Engine) SetModelerResolver(fn func(t *Task) *agent.Worker) { e.resolveModeler = fn }
+
 // snapshotFor returns the planner/worker a task should run on, from the task-router
 // resolver. nil,nil means the task is deliberately unavailable (e.g. an exhausted
 // failover chain); there is no global-pair fallback.
@@ -966,6 +975,15 @@ func (e *Engine) runWorkerStep(ctx context.Context, t *Task, name string, worker
 	intent := e.claimNext(t, name)
 	if intent == nil {
 		return false
+	}
+	// Business-modeling intents (seeded with Origin=="modeler") run on the modeler
+	// profile instead of the normal worker: function-graph tools + modeler prompt,
+	// no attack/finding tools. Fall back to the normal worker if no modeler resolver
+	// is wired (safe: the modeling intent just no-ops).
+	if intent.Origin == "modeler" && e.resolveModeler != nil {
+		if mk := e.resolveModeler(t); mk != nil {
+			worker = mk
+		}
 	}
 	log.Printf("[worker %s] task %s 领取意图 #%d", name, t.ID, intent.ID)
 	return e.runIntent(ctx, t, name, worker, intent, "", "")

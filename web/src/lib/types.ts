@@ -330,6 +330,41 @@ export interface CoverageAssetRefs {
   findings: CoverageAssetRef[];
 }
 
+// ---- Function graph (per task) ----
+// 业务功能图:module(一级模块)→feature(二级功能)→action(原子动作) 层级 + 角色可达性 +
+// maps_to 挂的真实接口 + 不变量(本不该如此)。key 唯一="f:<id>"。
+export interface FunctionGraphNode {
+  key: string;
+  kind: "module" | "feature" | "action";
+  name: string;
+  path?: string;
+  seen_roles?: string[];
+  confidence: "observed" | "inferred";
+  endpoints?: string[];
+}
+
+export interface FunctionGraphEdge {
+  src: string;
+  dst: string;
+  rel: "contains" | "precedes";
+}
+
+// 不变量:authz(越权)|ownership(归属·IDOR)|state(非法迁移)|resource(资源·额度)。
+export interface FunctionInvariant {
+  id: number;
+  kind: "authz" | "ownership" | "state" | "resource";
+  statement: string;
+  source: "role_diff" | "journey" | "hint" | "doc";
+  status: "open" | "holds" | "violated";
+  target_node?: number;
+}
+
+export interface FunctionGraphData {
+  nodes: FunctionGraphNode[];
+  edges: FunctionGraphEdge[];
+  invariants: FunctionInvariant[];
+}
+
 // ---- Workspace file manager (workDir) ----
 export interface WorkspaceEntry {
   name: string;

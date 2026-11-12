@@ -3937,6 +3937,50 @@ export const coverageGraph = {
   ],
 };
 
+// ── 业务功能图（/tasks/{id}/function-graph）──
+export const functionGraph = {
+  nodes: [
+    { key: "f:1", kind: "module", name: "订单模块", confidence: "observed", seen_roles: ["merchant", "admin"] },
+    { key: "f:2", kind: "module", name: "管理后台", confidence: "observed", seen_roles: ["admin"] },
+    { key: "f:3", kind: "feature", name: "退款", confidence: "observed", seen_roles: ["merchant", "admin"] },
+    {
+      key: "f:4",
+      kind: "action",
+      name: "提交退款申请",
+      path: "/order/:id/refund",
+      confidence: "observed",
+      seen_roles: ["merchant", "admin"],
+      endpoints: ["https://shop.acme.com/api/order/refund"],
+    },
+    {
+      key: "f:5",
+      kind: "action",
+      name: "强制退款",
+      path: "/admin/refund",
+      confidence: "observed",
+      seen_roles: ["admin"],
+      endpoints: ["https://shop.acme.com/api/admin/refund"],
+    },
+    { key: "f:6", kind: "action", name: "调试导出", path: "/api/debug/export", confidence: "inferred" },
+  ],
+  edges: [
+    { src: "f:1", dst: "f:3", rel: "contains" },
+    { src: "f:3", dst: "f:4", rel: "contains" },
+    { src: "f:2", dst: "f:5", rel: "contains" },
+  ],
+  invariants: [
+    {
+      id: 1,
+      kind: "authz",
+      statement: "merchant 不得到达 强制退款",
+      source: "role_diff",
+      status: "open",
+      target_node: 5,
+    },
+    { id: 2, kind: "state", statement: "退款不得从 cart 状态触发", source: "journey", status: "open" },
+  ],
+};
+
 // ── 资产在本任务关联的意图/事实/发现（/tasks/{id}/asset-refs）──
 // 播报板 demo:探索节点 → 其锚定资产。真实后端读 exploration_anchors,mock 里静态给几条。
 const NODE_ASSETS: Record<string, number[]> = {

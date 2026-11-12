@@ -24,8 +24,10 @@ type taskAgentBundle struct {
 	plannerRuntime *taskLLMRuntime
 	workerRuntime  *taskLLMRuntime
 	mainRuntime    *taskLLMRuntime
+	modelerRuntime *taskLLMRuntime // business-modeling profile runtime
 	pl             *agent.Planner
 	wk             *agent.Worker
+	mk             *agent.Worker // modeler-profile worker (Origin=="modeler" intents)
 	main           *agent.MainAgent
 }
 
@@ -571,6 +573,21 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	wk.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert())
 	wk.SetWebSearch(s.webSearchFor("worker"))
 	wk.SetConstraintInject(s.constraintInjectWorker) // 操作约束注入 worker(可配置,默认开)
+	// modeler-profile worker: same execution machine, business-modeling profile
+	// (function-graph tools, modeler prompt, no attack/finding tools). Runs intents
+	// seeded with Origin=="modeler". Uses its own "modeler" LLM runtime so its model/
+	// budget follow the modeler agent's config; constraints still inject (授权边界).
+	modelerRuntime := &taskLLMRuntime{s: s, taskID: t.ID, agentKey: "modeler"}
+	mk := agent.NewModelerWorker(modelerRuntime, "task-router", s.m.dir, tx, modelerRuntime.CompactionWindow(), s.agentMaxTurns("modeler"))
+	mk.SetFindingRecorder(s.evidenceStore())
+	mk.SetCompactionWindowResolver(modelerRuntime.CompactionWindow)
+	mk.SetNonStreaming(modelerRuntime.nonStreaming)
+	mk.SetMaxTokens(modelerRuntime.maxTokens)
+	mk.SetNoaEnabled(s.m.NoaCompactionEnabled)
+	mk.SetRunTimeout(time.Duration(s.agentRunSeconds("modeler")) * time.Second)
+	mk.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert())
+	mk.SetWebSearch(s.webSearchFor("modeler"))
+	mk.SetConstraintInject(s.constraintInjectWorker) // 授权边界约束同样注入建模阶段
 	pl := agent.NewPlanner(plannerRuntime, "task-router", s.m.dir, tx, plannerRuntime.CompactionWindow(), s.agentMaxTurns("planner"))
 	pl.SetFindingRecorder(s.evidenceStore())
 	pl.SetCompactionWindowResolver(plannerRuntime.CompactionWindow)
@@ -597,7 +614,7 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	main.SetSteerWork(s.engine.SteerWork) // steer_work：人对运行中 work 实时纠偏
 	bundle := &taskAgentBundle{
 		runtime: goalRuntime, plannerRuntime: plannerRuntime, workerRuntime: workerRuntime,
-		mainRuntime: mainRuntime, pl: pl, wk: wk, main: main,
+		mainRuntime: mainRuntime, modelerRuntime: modelerRuntime, pl: pl, wk: wk, mk: mk, main: main,
 	}
 	s.taskAgents[t.ID] = bundle
 	return bundle

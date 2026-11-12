@@ -62,7 +62,65 @@ func (s *Server) startTaskEngine(t *Task) {
 	if ctx.Err() != nil || s.engine.IsDeleting(t.ID) {
 		return
 	}
+	// 功能图(业务建模):满足门控时,在首轮 planner 之前种一条 modeler 意图,先把站点的
+	// 业务功能图(模块/功能/动作+角色可达性+不变量)建起来,供规划者系统性派越权/逻辑测试。
+	s.seedModelingIntent(t)
 	s.engine.Run(s.ctx, t)
+}
+
+// modelingEnabledKey gates the function-graph modeling feature globally. Absent or
+// any value other than "false" = ON (opt-out), so existing installs get it by default.
+const modelingEnabledKey = "function_graph_enabled"
+
+func (s *Server) modelingEnabled() bool {
+	if s.m.pg == nil {
+		return false
+	}
+	v, ok, _ := s.m.pg.GetSetting(modelingEnabledKey)
+	return !ok || v != "false"
+}
+
+// seedModelingIntent seeds a single modeler intent (Origin=="modeler") when the task
+// is a web/app target worth modeling. Gate: feature on + the task has a subdomain/
+// root_domain scope (a web host) + this exploration hasn't been modeled yet (idempotent
+// on re-launch). The engine dispatches an Origin=="modeler" intent to the modeler
+// profile; its graph write-back then wakes the planner (same mechanism as any worker).
+func (s *Server) seedModelingIntent(t *Task) {
+	if !s.modelingEnabled() || t == nil || t.Store == nil {
+		return
+	}
+	taskID, _ := strconv.ParseInt(t.ID, 10, 64)
+	// already modeled? (idempotent across relaunch — don't re-seed over an existing graph)
+	if n, err := t.Store.Functions().CountFunctionNodes(); err == nil && n > 0 {
+		return
+	}
+	// web target gate: need at least one subdomain/root_domain scope.
+	scopes, err := s.m.Assets().ListTaskScope(taskID)
+	if err != nil {
+		return
+	}
+	webTarget := false
+	for _, sc := range scopes {
+		if sc.Kind == "subdomain" || sc.Kind == "root_domain" {
+			webTarget = true
+			break
+		}
+	}
+	if !webTarget {
+		return
+	}
+	summary := fmt.Sprintf("业务建模:按角色重建【%s】的功能图(模块/功能/动作+角色可达性+不变量),只建模不攻击。", t.Goal)
+	// priority 9 > the normal seed intent's 8, so a worker claims the modeling intent
+	// first; its write-back then wakes the planner to start attack planning.
+	id, err := t.Store.AddIntent(map[string]any{"summary": summary}, 9, nil, "modeler")
+	if err != nil {
+		log.Printf("[modeler] task %s: 种建模意图失败: %v", t.ID, err)
+		return
+	}
+	if origin, _ := t.Store.OriginFactID(); origin > 0 {
+		_ = t.Store.Link(origin, db.RelDerivedFrom, id)
+	}
+	log.Printf("[modeler] task %s: 已下发建模意图 #%d", t.ID, id)
 }
 
 func (s *Server) occupiesConcurrencySlot(t *Task) bool {

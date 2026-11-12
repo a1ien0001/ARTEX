@@ -104,15 +104,10 @@ func (s *Store) writeBody(r io.Reader, expectedLength int64, expectedHash string
 	if err = os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return "", err
 	}
-	if err = os.Rename(f.Name(), path); err != nil {
+	if err = publishBody(f.Name(), path); err != nil {
 		return "", err
 	}
-	d, err := os.Open(filepath.Dir(path))
-	if err != nil {
-		return "", err
-	}
-	defer d.Close()
-	return hash, d.Sync()
+	return hash, nil
 }
 
 // StageFindingsExport freezes bindings/report versions and makes private body
