@@ -1750,6 +1750,35 @@ func (s *ExplorationStore) ActivityDetail(id int64) (string, error) {
 	return d.String, err
 }
 
+// ActivityEvidence returns one full activity only when it belongs to the given
+// intent in this exploration. It is used for report evidence, where an ID must
+// not be sufficient to cross task or intent boundaries.
+func (s *ExplorationStore) ActivityEvidence(id, intentID int64) (*Activity, error) {
+	var a Activity
+	err := s.db.QueryRow(`SELECT id,node_id,COALESCE(worker,''),COALESCE(kind,''),COALESCE(tool,''),
+COALESCE(tool_use_id,''),is_error,COALESCE(summary,''),COALESCE(detail,''),metadata,created_at
+FROM activity WHERE exploration_id=$1 AND node_id=$2 AND id=$3`, s.expID, intentID, id).Scan(
+		&a.ID, &a.NodeID, &a.Worker, &a.Kind, &a.Tool, &a.ToolUseID, &a.IsError, &a.Summary, &a.Detail, &a.Metadata, &a.CreatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return &a, nil
+}
+
+// ActivityToolUse finds the exact operation paired with a result activity.
+func (s *ExplorationStore) ActivityToolUse(intentID int64, toolUseID string, beforeID int64) (*Activity, error) {
+	var a Activity
+	err := s.db.QueryRow(`SELECT id,node_id,COALESCE(worker,''),COALESCE(kind,''),COALESCE(tool,''),
+COALESCE(tool_use_id,''),is_error,COALESCE(summary,''),COALESCE(detail,''),metadata,created_at
+FROM activity WHERE exploration_id=$1 AND node_id=$2 AND tool_use_id=$3 AND kind='tool_use' AND id<$4
+ORDER BY id DESC LIMIT 1`, s.expID, intentID, toolUseID, beforeID).Scan(
+		&a.ID, &a.NodeID, &a.Worker, &a.Kind, &a.Tool, &a.ToolUseID, &a.IsError, &a.Summary, &a.Detail, &a.Metadata, &a.CreatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return &a, nil
+}
+
 // scanTrace reads the summary-only column set shared by the worker-trace tools
 // (ActivityTrace / ActivityTraceSearch). Detail is never selected here — it is
 // pulled separately, on demand, via ActivityByIDs.

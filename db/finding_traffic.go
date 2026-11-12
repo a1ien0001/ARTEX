@@ -462,15 +462,29 @@ func (d *DB) SetFindingReportVersionByNodeID(ctx context.Context, nodeID int64, 
 			}
 			return err
 		}
-		if err := LockFindingEvidenceTx(tx, id, version); err != nil {
-			return err
-		}
-		res, err := tx.Exec(`UPDATE findings SET report=$2,report_evidence_version=COALESCE($3::bigint,CASE WHEN evidence_version=0 THEN 0 ELSE -1 END) WHERE id=$1`, id, report, version)
-		if err != nil {
-			return err
-		}
-		n, err = res.RowsAffected()
+		n, err = setFindingReportVersionTx(tx, id, report, version)
 		return err
 	})
 	return
+}
+
+// SetFindingReportVersionByID also works for retained findings whose originating
+// exploration node has been deleted. The evidence version is checked atomically.
+func (d *DB) SetFindingReportVersionByID(ctx context.Context, id int64, report string, version *int64) (n int64, err error) {
+	err = d.WithEvidenceTx(ctx, func(tx *sql.Tx) error {
+		n, err = setFindingReportVersionTx(tx, id, report, version)
+		return err
+	})
+	return
+}
+
+func setFindingReportVersionTx(tx *sql.Tx, id int64, report string, version *int64) (int64, error) {
+	if err := LockFindingEvidenceTx(tx, id, version); err != nil {
+		return 0, err
+	}
+	res, err := tx.Exec(`UPDATE findings SET report=$2,report_evidence_version=COALESCE($3::bigint,CASE WHEN evidence_version=0 THEN 0 ELSE -1 END) WHERE id=$1`, id, report, version)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
 }

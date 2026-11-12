@@ -55,6 +55,7 @@ type ToolSet struct {
 	as              *db.AssetStore   // asset store (optional; nil = asset tools not available)
 	cs              *db.CompanyStore // company store (optional)
 	ts              *db.ExplorationStore
+	fs              *db.FunctionStore // function graph store (optional; derived from ts via Functions(); nil = tools report unavailable)
 	worker          string
 	taskID          int64 // PG tasks.id; 0 when unknown (tests / orchestrator cross-task reads)
 	// coverageDisabled mirrors tasks.coverage_enabled=false. Stored inverted so the
@@ -141,18 +142,19 @@ type EnrichTrigger interface {
 // findings under "facts" (record_fact → Facts, insert_assets → Assets,
 // report_finding → Findings; each element of a batch counts once).
 type WriteCounts struct {
-	Facts    int
-	Assets   int
-	Findings int
+	Facts     int
+	Assets    int
+	Findings  int
+	FuncNodes int // function-graph nodes written this run (modeler's add_function_node)
 }
 
 // Total is every node persisted this run, regardless of kind — the
 // "explored but persisted nothing" signal (Total == 0).
-func (w WriteCounts) Total() int { return w.Facts + w.Assets + w.Findings }
+func (w WriteCounts) Total() int { return w.Facts + w.Assets + w.Findings + w.FuncNodes }
 
 // String renders the per-kind breakdown for logs, e.g. "事实1 资产25 漏洞0".
 func (w WriteCounts) String() string {
-	return fmt.Sprintf("事实%d 资产%d 漏洞%d", w.Facts, w.Assets, w.Findings)
+	return fmt.Sprintf("事实%d 资产%d 漏洞%d 功能%d", w.Facts, w.Assets, w.Findings, w.FuncNodes)
 }
 
 // Writes reports what this run wrote back, split by node kind (so the engine can
@@ -161,7 +163,7 @@ func (w WriteCounts) String() string {
 func (t *ToolSet) Writes() WriteCounts { return t.writes }
 
 func NewToolSet(ts *db.ExplorationStore, worker string) *ToolSet {
-	return &ToolSet{ts: ts, worker: worker}
+	return &ToolSet{ts: ts, fs: ts.Functions(), worker: worker}
 }
 
 // SetTaskID sets the PG task id on this ToolSet so that report_finding can

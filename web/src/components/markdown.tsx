@@ -1,7 +1,6 @@
 "use client";
 
-import * as React from "react";
-import ReactMarkdown, { type Components } from "react-markdown";
+import ReactMarkdown, { type Components, defaultUrlTransform } from "react-markdown";
 import remarkGfm from "remark-gfm";
 
 // Tailwind-styled element overrides (no typography plugin in this project, so we
@@ -17,6 +16,9 @@ const components: Components = {
   strong: ({ node, ...p }) => <strong className="font-semibold" {...p} />,
   a: ({ node, ...p }) => (
     <a className="text-primary underline underline-offset-2" target="_blank" rel="noreferrer" {...p} />
+  ),
+  img: ({ node, alt = "报告证据截图", ...p }) => (
+    <img alt={alt} className="my-2 h-auto max-w-full rounded-md border" loading="lazy" {...p} />
   ),
   hr: () => <hr className="my-2 border-border" />,
   blockquote: ({ node, ...p }) => (
@@ -42,16 +44,18 @@ const components: Components = {
       <table className="w-full border-collapse text-xs" {...p} />
     </div>
   ),
-  th: ({ node, ...p }) => (
-    <th className="border border-border bg-muted/60 px-2 py-1 text-left font-medium" {...p} />
-  ),
+  th: ({ node, ...p }) => <th className="border border-border bg-muted/60 px-2 py-1 text-left font-medium" {...p} />,
   td: ({ node, ...p }) => <td className="border border-border px-2 py-1 align-top" {...p} />,
 };
 
 export function Markdown({ text }: { text: string }) {
   return (
     <div className="min-w-0 space-y-1.5 text-sm [&>*:first-child]:mt-0">
-      <ReactMarkdown remarkPlugins={[remarkGfm]} components={components}>
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        components={components}
+        urlTransform={(url) => (/^data:image\/png;base64,[A-Za-z0-9+/=]+$/.test(url) ? url : defaultUrlTransform(url))}
+      >
         {text}
       </ReactMarkdown>
     </div>

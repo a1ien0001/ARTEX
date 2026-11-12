@@ -69,11 +69,9 @@ const pentestDefaultTmpl = `你是一个授权渗透测试系统的"独立渗透
 // render fallback in RunChat when the DB prompt is somehow missing.
 const DefaultAssistantPrompt = `你是一个乐于助人的 AI 助手。请用简洁、准确的中文回答用户的问题；在需要时使用可用的工具来完成任务。只做用户要求的事，不臆造信息。`
 
-// ReporterDefaultPrompt is the seeded prompt for the "报告撰写"(reporter) custom
-// agent — triggered when report_finding fires. It gathers the finding's full
-// evidence + how it was found, writes a Markdown vulnerability report, and saves
-// it via update_finding_report.
-const ReporterDefaultPrompt = `你是一个授权渗透测试系统里的**漏洞报告撰写 agent**。你不亲自渗透、不做利用——你的唯一职责是：为**刚刚被确认登记的某一个漏洞**撰写一份专业、可复现、面向修复的**详细报告(Markdown)**，并保存回该漏洞。
+// ReporterLegacyPrompt is retained verbatim so upgrades can recognize an
+// untouched default without overwriting a user-authored reporter prompt.
+const ReporterLegacyPrompt = `你是一个授权渗透测试系统里的**漏洞报告撰写 agent**。你不亲自渗透、不做利用——你的唯一职责是：为**刚刚被确认登记的某一个漏洞**撰写一份专业、可复现、面向修复的**详细报告(Markdown)**，并保存回该漏洞。
 
 ━━ 你是怎么被唤起的 ━━
 每当有 worker 调用 report_finding 登记了一个漏洞，系统就会用一段【由工具调用触发】的上下文唤起你，其中包含：
@@ -118,5 +116,6 @@ func BuiltinPromptSeeds() map[string]string {
 		"worker":    workerDefaultTmpl,
 		"auto":      autoDefaultTmpl,
 		"pentest":   pentestDefaultTmpl,
+		"modeler":   ModelerDefaultPrompt,
 	}
 }

@@ -660,6 +660,22 @@ func (t *ToolSet) WorkerTools() []actool.CoreTool {
 	}
 }
 
+// ModelerTools returns the tool set for the `modeler` (业务建模) agent. It builds the
+// function graph and does NOT attack: deliberately excludes report_finding and
+// record_fact (and all attack tooling) so "只建模不攻击" is enforced at the tool
+// surface, not just the prompt. It gets the function-graph write/read tools plus
+// asset登记 (so an action's触发接口 can be登记 then mapped) and read-back tools.
+func (t *ToolSet) ModelerTools() []actool.CoreTool {
+	out := t.FunctionTools()
+	out = append(out,
+		// 登记触发到的接口为资产 + 回看已登记资产(maps_to 要用 endpoint 的资产 id)。
+		t.insertAssets(), t.listAssets(),
+		// 回看本任务态势,避免重复建模(但不给 record_fact/report_finding)。
+		t.nodeDetail(),
+	)
+	return out
+}
+
 // MainAgentTools returns the human-interface tool set.
 func (t *ToolSet) MainAgentTools() []actool.CoreTool {
 	return []actool.CoreTool{
@@ -688,7 +704,7 @@ func (t *ToolSet) MainAgentTools() []actool.CoreTool {
 func (t *ToolSet) AllDomainTools() []actool.CoreTool {
 	seen := map[string]bool{}
 	var out []actool.CoreTool
-	all := append(append(t.MainAgentTools(), t.PlannerTools()...), t.WorkerTools()...)
+	all := append(append(append(t.MainAgentTools(), t.PlannerTools()...), t.WorkerTools()...), t.ModelerTools()...)
 	for _, tool := range all {
 		if !seen[tool.Name()] {
 			seen[tool.Name()] = true

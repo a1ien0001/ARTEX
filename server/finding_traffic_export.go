@@ -34,12 +34,25 @@ func writeFindingsZipEntries(zw *zip.Writer, findings []*db.DBFinding, stage str
 			name = fmt.Sprintf("%s-%d.md", strings.TrimSuffix(base, ".md"), n+1)
 		}
 		used[base]++
+		markdown, portableImages, err := report.PortableImages(report.SingleFindingMarkdown(f, now), fmt.Sprintf("evidence/%d/images", f.ID))
+		if err != nil {
+			return fmt.Errorf("转换漏洞 #%d 的报告图片: %w", f.ID, err)
+		}
 		w, err := zw.Create(name)
 		if err != nil {
 			return err
 		}
-		if _, err = io.WriteString(w, report.SingleFindingMarkdown(f, now)); err != nil {
+		if _, err = io.WriteString(w, markdown); err != nil {
 			return err
+		}
+		for _, image := range portableImages {
+			w, err := zw.Create(image.Name)
+			if err != nil {
+				return err
+			}
+			if _, err = w.Write(image.Data); err != nil {
+				return err
+			}
 		}
 		for _, b := range f.TrafficBindings {
 			prefix := fmt.Sprintf("evidence/%d/%d/", f.ID, b.ID)

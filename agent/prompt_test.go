@@ -63,6 +63,9 @@ func TestRenderSystemOverrideAndFallback(t *testing.T) {
 	if !strings.Contains(recording, "中间产物输出规约") {
 		t.Fatalf("worker missing artifact tail: %q", recording)
 	}
+	if !strings.Contains(recording, "browser_take_screenshot") || !strings.Contains(recording, "screenshots") || !strings.Contains(recording, "真实页面") {
+		t.Fatalf("worker prompt missing real page screenshot guidance: %q", recording)
+	}
 	// Egress proxy set but capture OFF (no CA): the ProxyAddr template branch still
 	// renders, but the trafficTool block must NOT — those tools are not registered.
 	egressOnly := workerSystem("127.0.0.1:8080", "", "/data", "/data")

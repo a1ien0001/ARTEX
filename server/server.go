@@ -43,6 +43,10 @@ type Server struct {
 	engine *Engine
 	ctx    context.Context
 
+	// reportImageRenderer is replaceable in server tests; production uses the
+	// bundled Playwright renderer for server-generated evidence cards.
+	reportImageRenderer func(context.Context, []report.EvidencePage) ([][]byte, error)
+
 	skillDir string // root directory for skill subdirectories
 	jwtKey   []byte // HS256 signing key loaded from / generated into dataDir/jwt.key
 
@@ -165,6 +169,15 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		b := s.agentsForTask(t)
 		return b.pl, b.wk
 	})
+	// Modeler resolver: the engine swaps to this for intents with Origin=="modeler"
+	// (business modeling). Gated on the modeler runtime being available; nil → the
+	// engine falls back to the normal worker.
+	s.engine.SetModelerResolver(func(t *Task) *agent.Worker {
+		if !s.taskRuntimeAvailable(t, "modeler") {
+			return nil
+		}
+		return s.agentsForTask(t).mk
+	})
 	// Global readiness (Ready()/llm_configured): a global active LLM provider is
 	// installed. Task-level runnability is separate (ReadyFor → the resolver above).
 	s.engine.SetReadiness(func() bool {
@@ -217,13 +230,16 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 			}
 			return a.TaskTimeoutWrapupMaxTurns, true
 		}
-		wireAgentAugment(m.pg, s.skillDir, s.hostTools) // 可见 skills/MCP + 流量/编排 host 工具装配进 agent 工具集
+		wireAgentAugment(m.pg, s.skillDir, m.dir, s.hostTools) // 可见 skills/MCP + 流量/编排 host 工具装配进 agent 工具集
 		domainReg := buildDomainReg(m.Assets())
 		wireTools(m.pg, domainReg) // 内置工具表：按 agent 过滤 + 覆盖描述/schema + 注入默认值
 		seedPrompts(m.pg)          // 内置 agent 默认提示词正文播种进 agent_prompts(仅空时)
 		s.seedOrchestrationTools() // P2 跨任务编排工具 seed 进 tools 表(可按 agent 绑定)
 		if err := s.seedFindingRetester(); err != nil {
 			log.Printf("[retester] seed: %v", err)
+		}
+		if err := s.seedModelerAgent(); err != nil {
+			log.Printf("[modeler] seed: %v", err)
 		}
 		go s.evidenceStore().RunGC(s.ctx)
 		s.seedPythonInterpreter()     // 自定义脚本工具:开机检测 python 解释器入库(仅空时)
@@ -701,6 +717,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/task-archives/delete/batch", s.deleteTaskArchivesBatch)
 	mux.HandleFunc("GET /api/tasks/{id}/coverage", s.taskCoverage)
 	mux.HandleFunc("GET /api/tasks/{id}/coverage-graph", s.taskCoverageGraph)
+	mux.HandleFunc("GET /api/tasks/{id}/function-graph", s.taskFunctionGraph)
 	mux.HandleFunc("GET /api/tasks/{id}/asset-refs", s.taskAssetRefs)
 	mux.HandleFunc("POST /api/tasks/{id}/assets", s.attachTaskAssets)
 	mux.HandleFunc("DELETE /api/tasks/{id}/assets/{assetID}", s.detachTaskAsset)
@@ -1779,6 +1796,23 @@ func (s *Server) taskCoverageGraph(w http.ResponseWriter, r *http.Request) {
 	}
 	taskID, _ := strconv.ParseInt(t.ID, 10, 64)
 	g, err := as.BuildCoverageGraph(taskID, t.ExpID)
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, 200, g)
+}
+
+// taskFunctionGraph serves the business function graph (modules→features→actions +
+// contains/maps_to edges + invariants) for the task detail "功能图" view. Built from
+// the exploration-scoped FunctionStore; empty graph when nothing has been modeled yet.
+func (s *Server) taskFunctionGraph(w http.ResponseWriter, r *http.Request) {
+	t, ok := s.m.Task(r.PathValue("id"))
+	if !ok {
+		writeErr(w, 404, "task not found")
+		return
+	}
+	g, err := s.m.pg.Functions(t.ExpID).BuildFunctionGraph()
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
