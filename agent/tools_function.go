@@ -321,11 +321,52 @@ func (t *ToolSet) getFunctionSubtree() actool.CoreTool {
 		})
 }
 
+// ---- resolve_invariant ----
+
+func (t *ToolSet) resolveInvariant() actool.CoreTool {
+	return t.writeExpTool("resolve_invariant",
+		"测完一条业务不变量后更新它的状态:holds(验证后【成立】——该被拒的确实被拒,无越权) | violated(【测出洞】——该被拒的却放行了,此时另外用 report_finding 上报漏洞)。"+
+			"invariant_id 来自你领到意图的 invariant_id 或 list/get 功能图。只是把判据的结论落库,证据仍走 report_finding。",
+		obj(map[string]any{
+			"invariant_id": idp("要更新的不变量 id"),
+			"status":       str("holds(不变量成立,无洞) | violated(测出洞)"),
+		}, "invariant_id", "status"),
+		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
+			if t.fs == nil {
+				return actool.Errorf("resolve_invariant 需要任务上下文(功能图)"), nil
+			}
+			var a struct {
+				InvariantID json.RawMessage `json:"invariant_id"`
+				Status      string          `json:"status"`
+			}
+			_ = json.Unmarshal(in, &a)
+			id := pid(a.InvariantID)
+			if id <= 0 {
+				return actool.Errorf("invariant_id 必须是正整数"), nil
+			}
+			if err := t.fs.SetInvariantStatus(id, a.Status); err != nil {
+				return actool.Errorf(err.Error()), nil
+			}
+			return actool.Text(fmt.Sprintf("invariant %d → %s", id, a.Status)), nil
+		})
+}
+
 // FunctionTools is the full function-graph tool set (write + read), shared by
 // ModelerTools and available for binding to other agents via the DB tools table.
 func (t *ToolSet) FunctionTools() []actool.CoreTool {
 	return []actool.CoreTool{
 		t.addFunctionNode(), t.mapFunctionToEndpoint(), t.addInvariant(),
 		t.recordFunctionAccess(), t.listFunctionNodes(), t.getFunctionSubtree(),
+	}
+}
+
+// FunctionAttackTools are the function-graph tools an ATTACK worker uses when it
+// tests an invariant assigned by the planner: read the graph, record the measured
+// matrix cell, and resolve the invariant. Deliberately a narrow subset — the attack
+// worker builds no structure (no add_function_node / add_invariant); it only测+回写.
+func (t *ToolSet) FunctionAttackTools() []actool.CoreTool {
+	return []actool.CoreTool{
+		t.listFunctionNodes(), t.getFunctionSubtree(),
+		t.recordFunctionAccess(), t.resolveInvariant(),
 	}
 }

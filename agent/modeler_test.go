@@ -34,6 +34,35 @@ func TestModelerToolSurface(t *testing.T) {
 	}
 }
 
+// TestWorkerFunctionAttackSurface pins the attack worker's function-graph surface:
+// it MUST have the read + matrix-write tools (to test an invariant and record the
+// result), but MUST NOT have the modeling-build tools (add_function_node /
+// add_invariant / map_function_to_endpoint) — building the graph is the modeler's
+// job, the worker only tests and writes back.
+func TestWorkerFunctionAttackSurface(t *testing.T) {
+	ts := NewToolSet(nil, "")
+	names := map[string]bool{}
+	for _, tool := range ts.WorkerTools() {
+		names[tool.Name()] = true
+	}
+	for _, want := range []string{"list_function_nodes", "get_function_subtree", "record_function_access", "resolve_invariant"} {
+		if !names[want] {
+			t.Errorf("worker tools missing function-attack tool %q", want)
+		}
+	}
+	for _, forbidden := range []string{"add_function_node", "add_invariant", "map_function_to_endpoint"} {
+		if names[forbidden] {
+			t.Errorf("worker must not include modeling-build tool %q (建图是 modeler 的职责)", forbidden)
+		}
+	}
+	// worker still has its core attack tools.
+	for _, want := range []string{"report_finding", "record_fact"} {
+		if !names[want] {
+			t.Errorf("worker tools missing core tool %q", want)
+		}
+	}
+}
+
 // TestModelerSeededAndBound ensures the catalog seeds the function-graph tools and
 // binds them to the "modeler" agent (so ToolResolve keeps them for modeler on fresh
 // databases), and that the modeler key made it into the seed iteration order.

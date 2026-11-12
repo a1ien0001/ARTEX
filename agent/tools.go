@@ -550,6 +550,21 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 			}
 		}
 	}
+	// function_graph：业务功能图态势 —— 让 planner 从「不变量清单」系统性派越权/逻辑测试
+	// 意图(而非只盯有信号的表面点)。只在功能图非空时带上,避免给纯网络任务塞无关字段。
+	if t.fs != nil {
+		if cnt, err := t.fs.CountFunctionNodes(); err == nil && cnt > 0 {
+			fg := map[string]any{"nodes_total": cnt}
+			if invs, err := t.fs.ListInvariants(db.InvStatusOpen, 50); err == nil && len(invs) > 0 {
+				// open 不变量就是本轮该派的攻击靶子清单(authz/ownership/state/resource)。
+				fg["open_invariants"] = invs
+			}
+			openInv, cells := t.fs.MatrixCoverage(t.taskID)
+			fg["authz_matrix"] = map[string]any{"open_invariants": openInv, "measured_cells": cells,
+				"note": "open_invariants 是尚未验证的越权/逻辑靶子:逐条用 add_intent 派换身份重放意图(带 invariant_id),worker 用 replay_as_role 验证并回写 function_access。open>0 时目标通常未测全。"}
+			out["function_graph"] = fg
+		}
+	}
 	return out
 }
 
@@ -1021,10 +1036,12 @@ func (t *ToolSet) nodeDetail() actool.CoreTool {
 
 // intentItem 是 add_intent 批量/单条的一条探索方向。
 type intentItem struct {
-	Summary   string            `json:"summary"`
-	AssetIDs  []json.RawMessage `json:"asset_ids"`
-	ParentIDs []json.RawMessage `json:"parent_ids"`
-	Priority  int               `json:"priority"`
+	Summary     string            `json:"summary"`
+	AssetIDs    []json.RawMessage `json:"asset_ids"`
+	ParentIDs   []json.RawMessage `json:"parent_ids"`
+	FuncNodeIDs []json.RawMessage `json:"function_node_ids"`
+	InvariantID json.RawMessage   `json:"invariant_id"`
+	Priority    int               `json:"priority"`
 }
 
 // addOneIntent 创建一条意图节点并连上游血缘，返回 id。
@@ -1070,6 +1087,14 @@ func (t *ToolSet) addOneIntent(it intentItem) (int64, error) {
 	if len(anchors) > 0 {
 		payload["asset_ids"] = anchors
 	}
+	// 功能图锚点:越权/逻辑意图带上它针对的功能节点和要验证的不变量,worker 据此知道
+	// 该测哪个动作、验哪条不变量,测完回写 function_access / 更新 invariant 状态。
+	if fnids := pidList(it.FuncNodeIDs); len(fnids) > 0 {
+		payload["function_node_ids"] = fnids
+	}
+	if invID := pid(it.InvariantID); invID > 0 {
+		payload["invariant_id"] = invID
+	}
 	id, err := t.ts.AddIntent(payload, priority, anchors, "planner")
 	if err != nil {
 		return 0, err
@@ -1094,11 +1119,13 @@ func (t *ToolSet) addIntent() actool.CoreTool {
 	return t.writeExpTool("add_intent", "生成【探索方向】写入 frontier，并连入探索链路。意图是开放的探索方向，不是固定类型——用 summary 一句话自由描述要探索/验证/利用什么。\n"+
 		"★优先批量：一轮筛出的多个新方向放进 intents 数组一次提交（比逐条调用省往返）。返回 ids 数组，与 intents 等长同序（失败项 id=0，详情见 errors）。单条则省略 intents 直接给顶层 summary。",
 		obj(map[string]any{
-			"intents":    map[string]any{"type": "array", "description": "【优先用这个】要新增的探索方向数组，按顺序处理。每个元素字段同下方顶层字段（summary/asset_ids/parent_ids/priority）。返回 ids 与本数组等长、同序。", "items": map[string]any{"type": "object"}},
-			"summary":    str("[单条] 一句话描述这个探索方向：做什么+为什么。已写清方向即可，不依赖资产 id。"),
-			"asset_ids":  map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "本方向要测试/攻击的【目标资产 id】（**尽量传**，0/1/多个；是 list_assets 返回的资产 id，不是探索节点 id）：这条探索方向针对哪些资产（站点/接口/参数/主机等）。只要方向围绕某些具体资产就务必传上——它是「这条探索打哪些目标」的结构化标记，用于覆盖去重、把意图连入资产链路。仅当纯全局侦察、确实没有具体目标资产时才留空。"},
-			"parent_ids": map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "上游锚点 id（可选，0/1/多个）：本方向由哪些【已确认的事实(fact)/发现(finding)】综合得出。**只能填已存在的 fact/finding 节点 id,不能填意图/目标/提示**——意图必须锚在已确认知识上,发现驱动而非凭空规划。多个事实共同产生一个新意图就传多个;顶层全新侦察方向请留空（会自动挂到任务起点 origin fact）。"},
-			"priority":   intp("优先级 0-10，默认5"),
+			"intents":           map[string]any{"type": "array", "description": "【优先用这个】要新增的探索方向数组，按顺序处理。每个元素字段同下方顶层字段（summary/asset_ids/parent_ids/priority）。返回 ids 与本数组等长、同序。", "items": map[string]any{"type": "object"}},
+			"summary":           str("[单条] 一句话描述这个探索方向：做什么+为什么。已写清方向即可，不依赖资产 id。"),
+			"asset_ids":         map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "本方向要测试/攻击的【目标资产 id】（**尽量传**，0/1/多个；是 list_assets 返回的资产 id，不是探索节点 id）：这条探索方向针对哪些资产（站点/接口/参数/主机等）。只要方向围绕某些具体资产就务必传上——它是「这条探索打哪些目标」的结构化标记，用于覆盖去重、把意图连入资产链路。仅当纯全局侦察、确实没有具体目标资产时才留空。"},
+			"parent_ids":        map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "上游锚点 id（可选，0/1/多个）：本方向由哪些【已确认的事实(fact)/发现(finding)】综合得出。**只能填已存在的 fact/finding 节点 id,不能填意图/目标/提示**——意图必须锚在已确认知识上,发现驱动而非凭空规划。多个事实共同产生一个新意图就传多个;顶层全新侦察方向请留空（会自动挂到任务起点 origin fact）。"},
+			"priority":          intp("优先级 0-10，默认5"),
+			"function_node_ids": map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "本方向针对的【功能图动作/功能节点 id】(可选,0/1/多个)：越权/逻辑测试意图务必传,来自 function_graph 态势或 list_function_nodes。worker 据此知道测哪个业务动作、测完回写 function_access。"},
+			"invariant_id":      idp("本意图要【验证或推翻】的不变量 id(可选)：派越权/非法迁移意图时从 function_graph.open_invariants 取。worker 验证后据结果把该不变量标 holds(成立)或 violated(测出洞)。"),
 		}),
 		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
 			var a struct {

@@ -642,7 +642,7 @@ func splitLines(s string) []string {
 
 // WorkerTools returns the tool set for a work agent.
 func (t *ToolSet) WorkerTools() []actool.CoreTool {
-	return []actool.CoreTool{
+	out := []actool.CoreTool{
 		// list_findings 保留：报漏洞前先查本任务已确认漏洞，避免重复上报同一漏洞。
 		t.listFindings(),
 		t.addFinding(), t.recordFact(),
@@ -658,6 +658,9 @@ func (t *ToolSet) WorkerTools() []actool.CoreTool {
 		// 以下工具仍【不给】worker，只留给 planner/main（读上下文、跨 work 复盘是规划职责，
 		// worker 只做单条意图的执行与写回）：list_facts / list_companies / list_worker_traces。
 	}
+	// 功能图攻击工具:worker 测规划者派的越权/逻辑意图时,读功能图 + 回写 function_access +
+	// 把不变量标 holds/violated(证据仍走 report_finding)。不含建模写入(那是 modeler 的事)。
+	return append(out, t.FunctionAttackTools()...)
 }
 
 // ModelerTools returns the tool set for the `modeler` (业务建模) agent. It builds the

@@ -302,6 +302,97 @@ func (s *FunctionStore) CountFunctionNodes() (int, error) {
 	return n, err
 }
 
+// InvariantRow is one invariant as the planner consumes it (attack target). It
+// carries the target node's name so the planner can phrase a concrete intent
+// without a second lookup.
+type InvariantRow struct {
+	ID         int64  `json:"id"`
+	Kind       string `json:"kind"`
+	Statement  string `json:"statement"`
+	Source     string `json:"source"`
+	Status     string `json:"status"`
+	TargetNode int64  `json:"target_node,omitempty"`
+	TargetName string `json:"target_name,omitempty"`
+	TargetPath string `json:"target_path,omitempty"`
+}
+
+// ListInvariants returns this exploration's invariants, newest first. status filters
+// by status when non-empty (e.g. "open" = untested attack targets). The target node's
+// name/path are joined in so the planner can派意图 without another query.
+func (s *FunctionStore) ListInvariants(status string, limit int) ([]InvariantRow, error) {
+	if s == nil {
+		return nil, nil
+	}
+	if limit <= 0 {
+		limit = 100
+	}
+	q := `SELECT i.id, i.kind, i.statement, i.source, i.status, COALESCE(i.target_node,0),
+	      COALESCE(n.name,''), COALESCE(n.path,'')
+	      FROM invariants i LEFT JOIN function_nodes n ON n.id = i.target_node
+	      WHERE i.exploration_id=$1`
+	args := []any{s.expID}
+	if st := status; st != "" {
+		args = append(args, st)
+		q += ` AND i.status=$2`
+	}
+	q += ` ORDER BY i.id DESC LIMIT ` + itoa64(int64(limit))
+	rows, err := s.db.Query(q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []InvariantRow
+	for rows.Next() {
+		var r InvariantRow
+		if err := rows.Scan(&r.ID, &r.Kind, &r.Statement, &r.Source, &r.Status, &r.TargetNode, &r.TargetName, &r.TargetPath); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// SetInvariantStatus updates one invariant's status (open→holds/violated) after an
+// attack worker tests it. Scoped to this exploration so a bad id can't touch another.
+func (s *FunctionStore) SetInvariantStatus(id int64, status string) error {
+	if s == nil {
+		return fmt.Errorf("function store 未初始化")
+	}
+	switch status {
+	case InvStatusOpen, InvStatusHolds, InvStatusViolated:
+	default:
+		return fmt.Errorf("status 必须是 open|holds|violated，收到 %q", status)
+	}
+	_, err := s.db.Exec(`UPDATE invariants SET status=$1 WHERE id=$2 AND exploration_id=$3`, status, id, s.expID)
+	return err
+}
+
+// MatrixCoverage reports authz-matrix progress for the planner's situational view:
+// how many open invariants remain (untested attack targets) and how many access
+// cells have been measured. Cheap aggregate queries.
+func (s *FunctionStore) MatrixCoverage(taskID int64) (openInvariants, measuredCells int) {
+	if s == nil {
+		return 0, 0
+	}
+	_ = s.db.QueryRow(`SELECT count(*) FROM invariants WHERE exploration_id=$1 AND status='open'`, s.expID).Scan(&openInvariants)
+	_ = s.db.QueryRow(`SELECT count(*) FROM function_access WHERE task_id=$1`, taskID).Scan(&measuredCells)
+	return openInvariants, measuredCells
+}
+
+func itoa64(n int64) string {
+	if n <= 0 {
+		return "0"
+	}
+	var b [20]byte
+	i := len(b)
+	for n > 0 {
+		i--
+		b[i] = byte('0' + n%10)
+		n /= 10
+	}
+	return string(b[i:])
+}
+
 // FunctionGraphData is the frontend payload: nodes + edges (contains + maps_to).
 type FunctionGraphData struct {
 	Nodes      []FunctionGraphNode `json:"nodes"`
